@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
+use headless_chrome::{Browser, FetcherOptions, LaunchOptions};
 use scraper::{Html, Selector};
+use std::time::Duration;
 
 /// TBC Pre-patch period: May 18, 2021 - June 1, 2021
 const TBC_PREPATCH_START: &str = "2021-05-18";
@@ -17,45 +19,60 @@ fn main() -> Result<()> {
     println!("Period: {} to {}", TBC_PREPATCH_START, TBC_PREPATCH_END);
     println!();
 
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        .build()?;
+    println!("Launching browser (will download Chromium if needed)...");
 
-    let mut page = 1;
+    let browser = Browser::new(LaunchOptions {
+        headless: true,
+        fetcher_options: FetcherOptions::default().with_allow_download(true),
+        ..Default::default()
+    })
+    .context("Failed to launch browser")?;
+
+    let mut page_num = 1;
     loop {
-        let url = format!("{}?zone={}&page={}", BASE_URL, ZONE_ID, page);
-        println!("Fetching page {}...", page);
+        let url = format!("{}?zone={}&page={}", BASE_URL, ZONE_ID, page_num);
+        println!("Fetching page {}...", page_num);
 
-        let response = client
-            .get(&url)
-            .send()
-            .context(format!("Failed to fetch page {}", page))?;
+        let tab = browser.new_tab().context("Failed to create new tab")?;
+        tab.navigate_to(&url)
+            .context(format!("Failed to navigate to {}", url))?;
 
-        if !response.status().is_success() {
-            anyhow::bail!("HTTP error: {}", response.status());
-        }
+        // Wait for page to load and JS to execute
+        std::thread::sleep(Duration::from_secs(3));
 
-        let html = response.text()?;
+        // Wait for the table to appear
+        let _ = tab.wait_for_element("table");
+
+        let html = tab
+            .get_content()
+            .context("Failed to get page content")?;
+
         let document = Html::parse_document(&html);
-
         let (logs, oldest_date) = parse_logs(&document, prepatch_start, prepatch_end)?;
 
         if !logs.is_empty() {
-            println!("\nFound {} logs from TBC pre-patch period on page {}:", logs.len(), page);
+            println!(
+                "\nFound {} logs from TBC pre-patch period on page {}:",
+                logs.len(),
+                page_num
+            );
             for log in &logs {
                 println!("  - {} | {}", log.date, log.title);
             }
-            println!("\nFirst matching page: {}", page);
+            println!("\nFirst matching page: {}", page_num);
             println!("URL: {}", url);
             return Ok(());
         }
 
         // Check if we've gone past the prepatch period (logs are in reverse chronological order)
         if let Some(oldest) = oldest_date {
+            println!("  Oldest date on page: {}", oldest);
             if oldest < prepatch_start {
                 println!("\nReached logs older than pre-patch period. No logs found.");
                 return Ok(());
             }
+        } else {
+            println!("  No dates found on this page");
         }
 
         // Check if there are more pages
@@ -64,10 +81,10 @@ fn main() -> Result<()> {
             return Ok(());
         }
 
-        page += 1;
+        page_num += 1;
 
         // Rate limiting
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(Duration::from_secs(1));
     }
 }
 
@@ -85,64 +102,34 @@ fn parse_logs(
     let mut matching_logs = Vec::new();
     let mut oldest_date: Option<NaiveDate> = None;
 
-    // WarcraftLogs uses a table with class "report-overview-table" or similar
-    // Each row contains date and report info
-    let row_selector = Selector::parse("tr.report-overview-row, table.report-overview-table tr")
-        .expect("valid selector");
-    let date_selector = Selector::parse("td.report-overview-date, .report-date, td:first-child")
-        .expect("valid selector");
-    let title_selector = Selector::parse("td.report-overview-title a, .report-title a, td a")
-        .expect("valid selector");
+    // WarcraftLogs uses table rows for reports
+    // Try multiple selectors to find the right structure
+    let row_selector =
+        Selector::parse("table tbody tr, .report-overview-table tr").expect("valid selector");
 
-    // Alternative: try parsing from the description list format
-    let alt_selector = Selector::parse(".zone-report-row, .report-row").expect("valid selector");
-
-    // First try table format
     for row in document.select(&row_selector) {
-        if let Some((date, title)) = extract_log_info(&row, &date_selector, &title_selector) {
+        let text = row.text().collect::<String>();
+
+        if let Some(date) = try_parse_date_from_text(&text) {
             oldest_date = Some(oldest_date.map_or(date, |d: NaiveDate| d.min(date)));
 
             if date >= start && date <= end {
-                matching_logs.push(LogEntry { title, date });
-            }
-        }
-    }
+                // Extract title from link
+                let title = row
+                    .select(&Selector::parse("a").unwrap())
+                    .next()
+                    .map(|a| a.text().collect::<String>())
+                    .unwrap_or_else(|| "Unknown".to_string());
 
-    // If no results, try alternative format
-    if matching_logs.is_empty() && oldest_date.is_none() {
-        for row in document.select(&alt_selector) {
-            let text = row.text().collect::<String>();
-            if let Some(date) = try_parse_date_from_text(&text) {
-                oldest_date = Some(oldest_date.map_or(date, |d: NaiveDate| d.min(date)));
-
-                if date >= start && date <= end {
-                    let title = row
-                        .select(&Selector::parse("a").unwrap())
-                        .next()
-                        .map(|a| a.text().collect::<String>())
-                        .unwrap_or_else(|| text.clone());
-                    matching_logs.push(LogEntry { title, date });
-                }
+                matching_logs.push(LogEntry {
+                    title: title.trim().to_string(),
+                    date,
+                });
             }
         }
     }
 
     Ok((matching_logs, oldest_date))
-}
-
-fn extract_log_info(
-    row: &scraper::ElementRef,
-    date_sel: &Selector,
-    title_sel: &Selector,
-) -> Option<(NaiveDate, String)> {
-    let date_elem = row.select(date_sel).next()?;
-    let date_text = date_elem.text().collect::<String>();
-    let date = try_parse_date_from_text(&date_text)?;
-
-    let title_elem = row.select(title_sel).next()?;
-    let title = title_elem.text().collect::<String>();
-
-    Some((date, title.trim().to_string()))
 }
 
 fn try_parse_date_from_text(text: &str) -> Option<NaiveDate> {
@@ -165,21 +152,19 @@ fn try_parse_date_from_text(text: &str) -> Option<NaiveDate> {
         }
     }
 
-    // Try to extract date pattern from text
+    // Try to extract date pattern from text using regex
     let date_patterns = [
-        r"(\d{4}-\d{2}-\d{2})",
-        r"(\d{1,2}/\d{1,2}/\d{4})",
-        r"(\d{1,2}/\d{1,2}/\d{2})",
+        (r"(\d{4}-\d{2}-\d{2})", "%Y-%m-%d"),
+        (r"(\d{1,2}/\d{1,2}/\d{4})", "%m/%d/%Y"),
+        (r"(\d{1,2}/\d{1,2}/\d{2})", "%m/%d/%y"),
     ];
 
-    for pattern in &date_patterns {
+    for (pattern, fmt) in &date_patterns {
         if let Ok(re) = regex_lite::Regex::new(pattern) {
             if let Some(cap) = re.captures(text) {
                 if let Some(m) = cap.get(1) {
-                    for fmt in &formats {
-                        if let Ok(date) = NaiveDate::parse_from_str(m.as_str(), fmt) {
-                            return Some(date);
-                        }
+                    if let Ok(date) = NaiveDate::parse_from_str(m.as_str(), fmt) {
+                        return Some(date);
                     }
                 }
             }
@@ -190,12 +175,14 @@ fn try_parse_date_from_text(text: &str) -> Option<NaiveDate> {
 }
 
 fn has_next_page(document: &Html) -> bool {
-    // Check for pagination links
-    let next_selector =
-        Selector::parse("a.pagination-next, .pagination a[rel='next'], a:contains('Next')")
-            .unwrap_or_else(|_| Selector::parse("a").unwrap());
-
-    document
-        .select(&next_selector)
-        .any(|a| a.text().collect::<String>().to_lowercase().contains("next"))
+    // Check for pagination - look for "Next" link or page numbers
+    if let Ok(selector) = Selector::parse("a") {
+        for a in document.select(&selector) {
+            let text = a.text().collect::<String>().to_lowercase();
+            if text.contains("next") || text.contains("›") || text.contains("»") {
+                return true;
+            }
+        }
+    }
+    false
 }
