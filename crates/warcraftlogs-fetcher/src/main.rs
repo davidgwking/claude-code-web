@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
-use headless_chrome::{Browser, FetcherOptions, LaunchOptions};
 use scraper::{Html, Selector};
 use std::time::Duration;
 
@@ -9,6 +8,7 @@ const TBC_PREPATCH_START: &str = "2021-05-18";
 const TBC_PREPATCH_END: &str = "2021-06-01";
 
 const START_URL: &str = "https://classic.warcraftlogs.com/zone/reports?zone=1006";
+const BASE_URL: &str = "https://classic.warcraftlogs.com";
 
 fn main() -> Result<()> {
     let prepatch_start = NaiveDate::parse_from_str(TBC_PREPATCH_START, "%Y-%m-%d")?;
@@ -18,27 +18,29 @@ fn main() -> Result<()> {
     println!("Period: {} to {}", TBC_PREPATCH_START, TBC_PREPATCH_END);
     println!();
 
-    println!("Launching browser (will download Chromium if needed)...");
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .timeout(Duration::from_secs(30))
+        .build()?;
 
-    let browser = Browser::new(LaunchOptions {
-        headless: true,
-        fetcher_options: FetcherOptions::default().with_allow_download(true),
-        ..Default::default()
-    })
-    .context("Failed to launch browser")?;
-
-    let tab = browser.new_tab().context("Failed to create tab")?;
-
-    println!("Navigating to {}...", START_URL);
-    tab.navigate_to(START_URL)?;
-    tab.wait_until_navigated()?;
-    std::thread::sleep(Duration::from_secs(2));
-
+    let mut current_url = START_URL.to_string();
     let mut page_num = 1;
-    loop {
-        println!("Checking page {}...", page_num);
 
-        let html = tab.get_content().context("Failed to get page content")?;
+    loop {
+        println!("Fetching page {}...", page_num);
+        println!("  URL: {}", current_url);
+
+        let response = client
+            .get(&current_url)
+            .send()
+            .context(format!("Failed to fetch {}", current_url))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("HTTP error: {}", status);
+        }
+
+        let html = response.text()?;
         let document = Html::parse_document(&html);
 
         let (logs, oldest_date) = parse_logs(&document, prepatch_start, prepatch_end)?;
@@ -52,7 +54,7 @@ fn main() -> Result<()> {
             for log in &logs {
                 println!("  - {} | {}", log.date, log.title);
             }
-            println!("\nCurrent URL: {}", tab.get_url());
+            println!("\nURL: {}", current_url);
             return Ok(());
         }
 
@@ -66,61 +68,37 @@ fn main() -> Result<()> {
             println!("  No dates found on this page");
         }
 
-        // Try to click "Next" button
-        match click_next(&tab) {
-            Ok(()) => {
-                std::thread::sleep(Duration::from_secs(2));
+        // Find "Next" link
+        match find_next_url(&document) {
+            Some(next_url) => {
+                current_url = next_url;
                 page_num += 1;
+                std::thread::sleep(Duration::from_millis(500));
             }
-            Err(_) => {
-                println!("\nNo more pages (couldn't find Next button).");
+            None => {
+                println!("\nNo more pages (couldn't find Next link).");
                 return Ok(());
             }
         }
     }
 }
 
-fn click_next(tab: &headless_chrome::Tab) -> Result<()> {
-    // Try various selectors for the "Next" pagination link
-    let selectors = [
-        "a.pagination-next",
-        ".pagination a:contains('Next')",
-        "a[rel='next']",
-        ".paging a:last-child",
-        "a.next",
-    ];
-
-    for selector in &selectors {
-        if let Ok(elem) = tab.find_element(selector) {
-            elem.click()?;
-            tab.wait_until_navigated()?;
-            return Ok(());
-        }
-    }
-
-    // Fallback: find any link containing "Next" text
-    let html = tab.get_content()?;
-    let document = Html::parse_document(&html);
-    let link_selector = Selector::parse("a").unwrap();
+fn find_next_url(document: &Html) -> Option<String> {
+    let link_selector = Selector::parse("a").ok()?;
 
     for link in document.select(&link_selector) {
-        let text = link.text().collect::<String>();
-        if text.to_lowercase().contains("next") {
-            // Get href and navigate
+        let text = link.text().collect::<String>().to_lowercase();
+        if text.contains("next") || text.trim() == "›" || text.trim() == "»" {
             if let Some(href) = link.value().attr("href") {
-                let url = if href.starts_with("http") {
+                return Some(if href.starts_with("http") {
                     href.to_string()
                 } else {
-                    format!("https://classic.warcraftlogs.com{}", href)
-                };
-                tab.navigate_to(&url)?;
-                tab.wait_until_navigated()?;
-                return Ok(());
+                    format!("{}{}", BASE_URL, href)
+                });
             }
         }
     }
-
-    anyhow::bail!("Could not find Next button")
+    None
 }
 
 #[derive(Debug)]
@@ -138,7 +116,7 @@ fn parse_logs(
     let mut oldest_date: Option<NaiveDate> = None;
 
     let row_selector =
-        Selector::parse("table tbody tr, .report-overview-table tr").expect("valid selector");
+        Selector::parse("table tbody tr").expect("valid selector");
 
     for row in document.select(&row_selector) {
         let text = row.text().collect::<String>();
@@ -165,24 +143,6 @@ fn parse_logs(
 }
 
 fn try_parse_date_from_text(text: &str) -> Option<NaiveDate> {
-    let formats = [
-        "%Y-%m-%d",
-        "%m/%d/%Y",
-        "%m/%d/%y",
-        "%B %d, %Y",
-        "%b %d, %Y",
-        "%d %B %Y",
-        "%d %b %Y",
-    ];
-
-    let text = text.trim();
-
-    for fmt in &formats {
-        if let Ok(date) = NaiveDate::parse_from_str(text, fmt) {
-            return Some(date);
-        }
-    }
-
     let date_patterns = [
         (r"(\d{4}-\d{2}-\d{2})", "%Y-%m-%d"),
         (r"(\d{1,2}/\d{1,2}/\d{4})", "%m/%d/%Y"),

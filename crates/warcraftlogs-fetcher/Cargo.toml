@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+reqwest = { workspace = true }
 scraper = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
 regex-lite = { workspace = true }
-headless_chrome = { workspace = true }
