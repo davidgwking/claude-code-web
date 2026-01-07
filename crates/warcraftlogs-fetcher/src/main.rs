@@ -21,6 +21,8 @@ fn main() -> Result<()> {
     let client = reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .timeout(Duration::from_secs(30))
+        .cookie_store(true)
+        .gzip(true)
         .build()?;
 
     let mut current_url = START_URL.to_string();
@@ -32,6 +34,16 @@ fn main() -> Result<()> {
 
         let response = client
             .get(&current_url)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Accept-Encoding", "gzip, deflate, br")
+            .header("Connection", "keep-alive")
+            .header("Sec-Fetch-Dest", "document")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Site", "none")
+            .header("Sec-Fetch-User", "?1")
+            .header("Upgrade-Insecure-Requests", "1")
+            .header("Cache-Control", "max-age=0")
             .send()
             .context(format!("Failed to fetch {}", current_url))?;
 
