@@ -8,8 +8,7 @@ use std::time::Duration;
 const TBC_PREPATCH_START: &str = "2021-05-18";
 const TBC_PREPATCH_END: &str = "2021-06-01";
 
-const BASE_URL: &str = "https://classic.warcraftlogs.com/zone/reports";
-const ZONE_ID: u32 = 1006; // Naxxramas
+const START_URL: &str = "https://classic.warcraftlogs.com/zone/reports?zone=1006";
 
 fn main() -> Result<()> {
     let prepatch_start = NaiveDate::parse_from_str(TBC_PREPATCH_START, "%Y-%m-%d")?;
@@ -28,26 +27,20 @@ fn main() -> Result<()> {
     })
     .context("Failed to launch browser")?;
 
+    let tab = browser.new_tab().context("Failed to create tab")?;
+
+    println!("Navigating to {}...", START_URL);
+    tab.navigate_to(START_URL)?;
+    tab.wait_until_navigated()?;
+    std::thread::sleep(Duration::from_secs(2));
+
     let mut page_num = 1;
     loop {
-        let url = format!("{}?zone={}&page={}", BASE_URL, ZONE_ID, page_num);
-        println!("Fetching page {}...", page_num);
+        println!("Checking page {}...", page_num);
 
-        let tab = browser.new_tab().context("Failed to create new tab")?;
-        tab.navigate_to(&url)
-            .context(format!("Failed to navigate to {}", url))?;
-
-        // Wait for page to load and JS to execute
-        std::thread::sleep(Duration::from_secs(3));
-
-        // Wait for the table to appear
-        let _ = tab.wait_for_element("table");
-
-        let html = tab
-            .get_content()
-            .context("Failed to get page content")?;
-
+        let html = tab.get_content().context("Failed to get page content")?;
         let document = Html::parse_document(&html);
+
         let (logs, oldest_date) = parse_logs(&document, prepatch_start, prepatch_end)?;
 
         if !logs.is_empty() {
@@ -59,33 +52,75 @@ fn main() -> Result<()> {
             for log in &logs {
                 println!("  - {} | {}", log.date, log.title);
             }
-            println!("\nFirst matching page: {}", page_num);
-            println!("URL: {}", url);
+            println!("\nCurrent URL: {}", tab.get_url());
             return Ok(());
         }
 
-        // Check if we've gone past the prepatch period (logs are in reverse chronological order)
         if let Some(oldest) = oldest_date {
             println!("  Oldest date on page: {}", oldest);
             if oldest < prepatch_start {
-                println!("\nReached logs older than pre-patch period. No logs found.");
+                println!("\nReached logs older than pre-patch period. Stopping.");
                 return Ok(());
             }
         } else {
             println!("  No dates found on this page");
         }
 
-        // Check if there are more pages
-        if !has_next_page(&document) {
-            println!("\nNo more pages. No logs found from pre-patch period.");
+        // Try to click "Next" button
+        match click_next(&tab) {
+            Ok(()) => {
+                std::thread::sleep(Duration::from_secs(2));
+                page_num += 1;
+            }
+            Err(_) => {
+                println!("\nNo more pages (couldn't find Next button).");
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn click_next(tab: &headless_chrome::Tab) -> Result<()> {
+    // Try various selectors for the "Next" pagination link
+    let selectors = [
+        "a.pagination-next",
+        ".pagination a:contains('Next')",
+        "a[rel='next']",
+        ".paging a:last-child",
+        "a.next",
+    ];
+
+    for selector in &selectors {
+        if let Ok(elem) = tab.find_element(selector) {
+            elem.click()?;
+            tab.wait_until_navigated()?;
             return Ok(());
         }
-
-        page_num += 1;
-
-        // Rate limiting
-        std::thread::sleep(Duration::from_secs(1));
     }
+
+    // Fallback: find any link containing "Next" text
+    let html = tab.get_content()?;
+    let document = Html::parse_document(&html);
+    let link_selector = Selector::parse("a").unwrap();
+
+    for link in document.select(&link_selector) {
+        let text = link.text().collect::<String>();
+        if text.to_lowercase().contains("next") {
+            // Get href and navigate
+            if let Some(href) = link.value().attr("href") {
+                let url = if href.starts_with("http") {
+                    href.to_string()
+                } else {
+                    format!("https://classic.warcraftlogs.com{}", href)
+                };
+                tab.navigate_to(&url)?;
+                tab.wait_until_navigated()?;
+                return Ok(());
+            }
+        }
+    }
+
+    anyhow::bail!("Could not find Next button")
 }
 
 #[derive(Debug)]
@@ -102,8 +137,6 @@ fn parse_logs(
     let mut matching_logs = Vec::new();
     let mut oldest_date: Option<NaiveDate> = None;
 
-    // WarcraftLogs uses table rows for reports
-    // Try multiple selectors to find the right structure
     let row_selector =
         Selector::parse("table tbody tr, .report-overview-table tr").expect("valid selector");
 
@@ -114,7 +147,6 @@ fn parse_logs(
             oldest_date = Some(oldest_date.map_or(date, |d: NaiveDate| d.min(date)));
 
             if date >= start && date <= end {
-                // Extract title from link
                 let title = row
                     .select(&Selector::parse("a").unwrap())
                     .next()
@@ -133,7 +165,6 @@ fn parse_logs(
 }
 
 fn try_parse_date_from_text(text: &str) -> Option<NaiveDate> {
-    // Try various date formats used by WarcraftLogs
     let formats = [
         "%Y-%m-%d",
         "%m/%d/%Y",
@@ -152,7 +183,6 @@ fn try_parse_date_from_text(text: &str) -> Option<NaiveDate> {
         }
     }
 
-    // Try to extract date pattern from text using regex
     let date_patterns = [
         (r"(\d{4}-\d{2}-\d{2})", "%Y-%m-%d"),
         (r"(\d{1,2}/\d{1,2}/\d{4})", "%m/%d/%Y"),
@@ -172,17 +202,4 @@ fn try_parse_date_from_text(text: &str) -> Option<NaiveDate> {
     }
 
     None
-}
-
-fn has_next_page(document: &Html) -> bool {
-    // Check for pagination - look for "Next" link or page numbers
-    if let Ok(selector) = Selector::parse("a") {
-        for a in document.select(&selector) {
-            let text = a.text().collect::<String>().to_lowercase();
-            if text.contains("next") || text.contains("›") || text.contains("»") {
-                return true;
-            }
-        }
-    }
-    false
 }
