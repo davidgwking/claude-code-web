@@ -9,13 +9,46 @@ crates/
   scratch/     # General scratch crate for experiments
 ```
 
+## Setup
+
+Install just (task runner) and recommended cargo tools:
+
+```bash
+# Install just
+cargo install just
+
+# Install all recommended tools
+just install-tools
+```
+
 ## Quick Commands
 
 ```bash
-cargo c        # Check all
-cargo t        # Test all
-cargo cl       # Clippy all
-cargo fc       # Format check
+just              # List all available commands
+just all          # Run format check, clippy, tests, audit
+just check        # Quick compile check
+just test         # Run all tests
+just clippy       # Run clippy lints
+just fmt          # Format code
+```
+
+## Security & Dependencies
+
+```bash
+just audit        # Check for security vulnerabilities (cargo-audit)
+just deny         # License and advisory checks (cargo-deny)
+just geiger       # Scan for unsafe code usage
+just outdated     # Check for outdated dependencies
+just machete      # Find unused dependencies
+just semver-check # Check for semver violations
+```
+
+## Analysis
+
+```bash
+just bloat scratch        # Analyze binary size
+just bloat-funcs scratch  # Show largest functions
+just bloat-deps scratch   # Show dependency sizes
 ```
 
 ## Adding a New Crate
@@ -40,6 +73,14 @@ workspace = true
 
 ## Tooling
 
-- **rustfmt** - formatting
-- **clippy** - linting (pedantic + nursery enabled)
-- **cargo-deny** - license and advisory checks
+| Tool | Purpose | Command |
+|------|---------|---------|
+| rustfmt | Code formatting | `just fmt` |
+| clippy | Linting (pedantic + nursery) | `just clippy` |
+| cargo-deny | License & advisory checks | `just deny` |
+| cargo-audit | Security vulnerability checks | `just audit` |
+| cargo-geiger | Unsafe code analysis | `just geiger` |
+| cargo-outdated | Dependency freshness | `just outdated` |
+| cargo-machete | Unused dependency detection | `just machete` |
+| cargo-semver-checks | Semver violation detection | `just semver-check` |
+| cargo-bloat | Binary size analysis | `just bloat <bin>` |
